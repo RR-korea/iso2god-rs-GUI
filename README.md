@@ -14,6 +14,7 @@ For example using 12 threads on my AMD Ryzen 9 6900HS 1.6.0 converts a game in 1
 
 - 🔍 **Automatic Folder Watching**: Just point it to a folder and it'll detect new ISOs automatically
 - 🎯 **Smart Queue System**: Handles multiple ISOs in sequence with retry capability
+- 📤 **FTP Support**: Upload games automatically to the console once they're converted
 - ⚙️ **Configurable Settings**:
   - Watch & output directory paths
   - Number of processing threads

@@ -6,5 +6,11 @@
     "scan_delay": "2",
     "delete_iso": true,
     "process_timeout": "0",
-    "iso2god_binary": "linux-1.5.4"
+    "iso2god_binary": "linux-1.5.4",
+    "use_ftp": false,
+    "ip_addr": "",
+    "ftp_port": "",
+    "ftp_user": "",
+    "ftp_pass": "",
+    "drv_name": ""
 }

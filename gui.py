@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 import subprocess
+from ftplib import FTP
 from pathlib import Path
 import re
 
@@ -44,7 +45,14 @@ from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 from tkinter import filedialog, messagebox
 
 # Get the directory containing the script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def get_app_dir():
+    """Return the folder where the EXE (or script) is located."""
+    if getattr(sys, 'frozen', False):  # running from PyInstaller
+        return os.path.dirname(sys.executable)
+    else:  # running from source
+        return os.path.dirname(os.path.abspath(__file__))
+
+SCRIPT_DIR = get_app_dir()
 ISO2GOD_DIR = os.path.join(SCRIPT_DIR, "iso2god")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "watcher_config.json")
 
@@ -56,7 +64,13 @@ DEFAULT_CONFIG = {
     "scan_delay": "2",  # Default 2 second scan delay
     "delete_iso": True,  # Default to deleting ISOs after conversion
     "process_timeout": "0",  # 0 means no timeout, otherwise in minutes
-    "iso2god_binary": ""
+    "iso2god_binary": "",
+    "use_ftp": False,
+    "ip_addr": "",
+    "ftp_port": "",
+    "ftp_user": "",
+    "ftp_pass": "",
+    "drv_name": ""
 }
 
 class IsoHandler(FileSystemEventHandler):
@@ -224,7 +238,13 @@ class Iso2GodGUI:
             "scan_delay": self.scan_delay.get(),
             "delete_iso": self.delete_iso_var.get(),
             "process_timeout": self.process_timeout.get(),
-            "iso2god_binary": self.selected_iso2god.get()
+            "iso2god_binary": self.selected_iso2god.get(),
+            "use_ftp": self.use_ftp.get(),
+            "ip_addr": self.ftp_ip.get(),
+            "ftp_port": self.ftp_port.get(),
+            "ftp_user": self.ftp_user.get(),
+            "ftp_pass": self.ftp_pass.get(),
+            "drv_name": self.drv_field.get()
         }
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -316,6 +336,86 @@ class Iso2GodGUI:
         delete_check = ttk.Checkbutton(checkbox_frame, text="Delete ISO after conversion", variable=self.delete_iso_var)
         delete_check.pack(side="left", padx=5)
 
+        # Send on FTP Option
+        self.use_ftp = tk.BooleanVar(value=self.config.get("use_ftp", False))
+        ftp_check = ttk.Checkbutton(checkbox_frame, text="FTP Transfer", variable=self.use_ftp)
+        ftp_check.pack(side="left", padx=5)
+
+        ftp_frame = ttk.Frame(main_container)
+        ftp_frame.pack(fill="x", pady=5)
+
+        self.ftp_ip = ttk.Entry(ftp_frame, width=15)
+        self.ftp_ip.pack(side="left", fill="x", padx=5)
+        ip_address = self.config.get("ip_addr", "IP Address") or "IP Address"
+        self.ftp_ip.insert(0, ip_address)
+        self.ftp_ip.config(foreground="gray" if ip_address == "IP Address" else "black")
+        self.ftp_ip.bind("<FocusIn>", lambda e: (
+            self.ftp_ip.delete(0, tk.END) if self.ftp_ip.get() == "IP Address" else None,
+            self.ftp_ip.config(foreground="black")
+        ))
+        self.ftp_ip.bind("<FocusOut>", lambda e: (
+            self.ftp_ip.insert(0, "IP Address") if not self.ftp_ip.get() else None,
+            self.ftp_ip.config(foreground="gray" if self.ftp_ip.get() == "IP Address" else "black")
+        ))
+
+        self.ftp_user = ttk.Entry(ftp_frame, width=20)
+        self.ftp_user.pack(side="left", fill="x", padx=5)
+        user_value = self.config.get("ftp_user", "Username") or "Username"
+        self.ftp_user.insert(0, user_value)
+        self.ftp_user.config(foreground="gray" if user_value == "Username" else "black")
+        self.ftp_user.bind("<FocusIn>", lambda e: (
+            self.ftp_user.delete(0, tk.END) if self.ftp_user.get() == "Username" else None,
+            self.ftp_user.config(foreground="black")
+        ))
+        self.ftp_user.bind("<FocusOut>", lambda e: (
+            self.ftp_user.insert(0, "Username") if not self.ftp_user.get() else None,
+            self.ftp_user.config(foreground="gray" if self.ftp_user.get() == "Username" else "black")
+        ))
+
+        self.ftp_pass = ttk.Entry(ftp_frame)
+        self.ftp_pass.pack(side="left", fill="x", padx=5)
+        pass_value = self.config.get("ftp_pass", "Password") or "Password"
+        self.ftp_pass.insert(0, pass_value)
+        self.ftp_pass.config(foreground="gray" if self.ftp_pass.get() == "Password" else "black",
+                                show="" if self.ftp_pass.get() == "Password" else "*")
+        self.ftp_pass.bind("<FocusIn>", lambda e: (
+            self.ftp_pass.delete(0, tk.END) if self.ftp_pass.get() == "Password" else None,
+            self.ftp_pass.config(foreground="black", show="*" if self.ftp_pass.get() != "Password" else "")
+        ))
+        self.ftp_pass.bind("<FocusOut>", lambda e: (
+            self.ftp_pass.insert(0, "Password") if not self.ftp_pass.get() else None,
+            self.ftp_pass.config(foreground="gray" if self.ftp_pass.get() == "Password" else "black",
+                                show="" if self.ftp_pass.get() == "Password" else "*")
+        ))
+
+        self.ftp_port = ttk.Entry(ftp_frame, width=17)
+        self.ftp_port.pack(side="left", fill="x", padx=5)
+        port_value = self.config.get("ftp_port", "Port (default: 21)") or "Port (default: 21)"
+        self.ftp_port.insert(0, port_value)
+        self.ftp_port.config(foreground="gray" if port_value == "Port (default: 21)" else "black")
+        self.ftp_port.bind("<FocusIn>", lambda e: (
+            self.ftp_port.delete(0, tk.END) if self.ftp_port.get() == "Port (default: 21)" else None,
+            self.ftp_port.config(foreground="black")
+        ))
+        self.ftp_port.bind("<FocusOut>", lambda e: (
+            self.ftp_port.insert(0, "Port (default: 21)") if not self.ftp_port.get() else None,
+            self.ftp_port.config(foreground="gray" if self.ftp_port.get() == "Port (default: 21)" else "black")
+        ))
+
+        self.drv_field = ttk.Entry(ftp_frame, width=30)
+        self.drv_field.pack(side="left", fill="x", padx=5)
+        user_value = self.config.get("drv_name", "Drive Folder (default: Hdd1)") or "Drive Folder (default: Hdd1)"
+        self.drv_field.insert(0, user_value)
+        self.drv_field.config(foreground="gray" if user_value == "Drive Folder (default: Hdd1)" else "black")
+        self.drv_field.bind("<FocusIn>", lambda e: (
+            self.drv_field.delete(0, tk.END) if self.drv_field.get() == "Drive Folder (default: Hdd1)" else None,
+            self.drv_field.config(foreground="black")
+        ))
+        self.drv_field.bind("<FocusOut>", lambda e: (
+            self.drv_field.insert(0, "Drive Folder (default: Hdd1)") if not self.drv_field.get() else None,
+            self.drv_field.config(foreground="gray" if self.drv_field.get() == "Drive Folder (default: Hdd1)" else "black")
+        ))
+
         # Current Game Title Display (Read-only)
         game_frame = ttk.Frame(main_container)
         game_frame.pack(fill="x", pady=5)
@@ -348,6 +448,51 @@ class Iso2GodGUI:
         self.status_text.tag_configure("success", foreground="green", font=("Consolas", 10, "bold"))
         self.status_text.tag_configure("error", foreground="red", font=("Consolas", 10, "bold"))
         self.status_text.configure(state="disabled")
+
+
+    ftp = FTP()
+
+    def upload_file_with_progress(self, local_path, remote_name):
+        total_size = os.path.getsize(local_path)
+        uploaded = 0
+        last_percent = 0
+
+        def callback(data):
+            nonlocal uploaded
+            nonlocal last_percent
+            uploaded += len(data)
+            percent = int(uploaded / total_size * 100)
+            if percent >= last_percent + 10:
+                last_percent = (percent // 10) * 10
+                self.update_status(f"\rUploading {remote_name}: {percent:.2f}%")
+
+        with open(local_path, "rb") as f:
+            self.ftp.storbinary(f"STOR {remote_name}", f, 1024, callback=callback)
+
+    def upload_folder(self, local_dir, remote_dir):
+        try:
+            self.ftp.mkd(remote_dir)
+        except:
+            pass
+        self.ftp.cwd(remote_dir)
+
+        for item in os.listdir(local_dir):
+            local_path = os.path.join(local_dir, item)
+            if os.path.isdir(local_path):
+                self.upload_folder(local_path, item)
+                self.ftp.cwd("..")
+            else:
+                self.upload_file_with_progress(local_path, item)
+
+        self.update_status("FTP Transfer Complete!")
+
+    def send_over_ftp(self):
+        self.ftp.connect(self.ftp_ip.get(), 21 if self.ftp_port.get() == "Port (default: 21)" else int(self.ftp_port.get()))
+        self.ftp.login(self.ftp_user.get(), self.ftp_pass.get())
+        local_folder = self.output_path.get()     
+        remote_folder = ("Hdd1" if self.drv_field.get() == "Drive Folder (default: Hdd1)" else self.drv_field.get())+"/Content/0000000000000000"
+
+        self.upload_folder(local_folder, remote_folder)
 
     def browse_watch_dir(self):
         directory = filedialog.askdirectory()
@@ -669,6 +814,16 @@ class Iso2GodGUI:
             if iso_path in self.handler.processing:
                 self.handler.processing.remove(iso_path)
             self.iso_queue.task_done()
+            if self.use_ftp.get():
+                if current_index == total_count:
+                    try:
+                        self.update_status("FTP Transfer: Yes")
+                        self.send_over_ftp()
+                    except:
+                        self.update_status("FTP Transfer Error.")
+            else:
+                self.update_status("FTP Transfer: No")
+
             self.update_status("Ready for next file in queue", current_index=current_index, total_count=total_count)
 
     def run(self):
