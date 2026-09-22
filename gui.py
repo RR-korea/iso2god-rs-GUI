@@ -8,80 +8,91 @@ import subprocess
 from ftplib import FTP
 from pathlib import Path
 import re
-
-# Check if pip is installed
-def check_pip():
-    try:
-        import pip
-    except ImportError:
-        print("ERROR: pip is not installed.")
-        sys.exit()   
-
-check_pip()
-
-def install_requirements():
-    try:
-        # Get the directory containing this script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        requirements_path = os.path.join(script_dir, "requirements.txt")
-        
-        if os.path.exists(requirements_path):
-            print("Installing requirements...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", requirements_path])
-            print("Requirements installed successfully!")
-        else:
-            print("requirements.txt not found!")
-    except Exception as e:
-        print(f"Error installing requirements: {str(e)}")
-        sys.exit(1)
-
-# Install requirements before importing them
-install_requirements()
-
 import tkinter as tk
-from tkinter import ttk
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent
-from tkinter import filedialog, messagebox
+from tkinter import ttk, font, filedialog, messagebox
+import tkinter.scrolledtext as scrolledtext
 
-# Get the directory containing the script
+# --- High DPI Awareness for Windows ---
+if sys.platform == "win32":
+    try:
+        import ctypes
+        # SetProcessDpiAwareness(2) for Per-Monitor High DPI V2
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+# --- Dependency check (only when running from source, not frozen) ---
+def ensure_requirements():
+    if getattr(sys, 'frozen', False):
+        return  # Frozen executable has everything bundled
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    req_file = os.path.join(script_dir, "requirements.txt")
+    if os.path.exists(req_file):
+        try:
+            import watchdog
+        except ImportError:
+            print("Installing required dependencies (watchdog)...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_file])
+            except Exception as e:
+                print(f"Warning: Failed to install requirements: {e}")
+
+ensure_requirements()
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+except ImportError:
+    Observer = None
+    FileSystemEventHandler = object
+    FileCreatedEvent = None
+
+# --- Path Resolution Helpers ---
+def get_bundle_dir():
+    """Return the temporary folder where PyInstaller extracts bundled files."""
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 def get_app_dir():
-    """Return the folder where the EXE (or script) is located."""
-    if getattr(sys, 'frozen', False):  # running from PyInstaller
+    """Return the folder where the EXE (or main script) is located."""
+    if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    else:  # running from source
-        return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.abspath(__file__))
 
-SCRIPT_DIR = get_app_dir()
-ISO2GOD_DIR = os.path.join(SCRIPT_DIR, "iso2god")
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "watcher_config.json")
+BUNDLE_DIR = get_bundle_dir()
+APP_DIR = get_app_dir()
+CONFIG_FILE = os.path.join(APP_DIR, "watcher_config.json")
 
 DEFAULT_CONFIG = {
     "watch_dir": "",
     "output_dir": "",
     "trim_unused": False,
     "thread_count": "4",
-    "scan_delay": "2",  # Default 2 second scan delay
-    "delete_iso": True,  # Default to deleting ISOs after conversion
-    "process_timeout": "0",  # 0 means no timeout, otherwise in minutes
+    "scan_delay": "2",
+    "delete_iso": True,
+    "process_timeout": "0",
     "iso2god_binary": "",
     "use_ftp": False,
     "ip_addr": "",
-    "ftp_port": "",
+    "ftp_port": "21",
     "ftp_user": "",
     "ftp_pass": "",
-    "drv_name": ""
+    "drv_name": "Hdd1"
 }
 
 class IsoHandler(FileSystemEventHandler):
-    def __init__(self, queue, extensions=('.iso',)):
+    def __init__(self, queue_obj, extensions=('.iso',)):
         super().__init__()
-        self.queue = queue
+        self.queue = queue_obj
         self.extensions = extensions
         self.processing = set()
         self.last_event_time = {}
-        self.scan_delay = 2.0  # Default delay
-        self._stop_event = threading.Event()
+        self.scan_delay = 2.0
 
     def set_scan_delay(self, delay):
         try:
@@ -92,14 +103,10 @@ class IsoHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory and event.src_path.lower().endswith(self.extensions):
             current_time = time.time()
-            
-            # Check if we've seen this file before and if enough time has passed
             if event.src_path in self.last_event_time:
                 if current_time - self.last_event_time[event.src_path] < self.scan_delay:
-                    return  # Not enough time has passed
-            
+                    return
             self.last_event_time[event.src_path] = current_time
-            
             if event.src_path not in self.processing:
                 self.queue.put(event.src_path)
                 self.processing.add(event.src_path)
@@ -117,116 +124,175 @@ class DirectoryWatcher(threading.Thread):
 
     def check_directory(self):
         try:
+            if not os.path.exists(self.path):
+                return
             current_files = set()
             for file in os.listdir(self.path):
                 if file.lower().endswith('.iso'):
                     filepath = os.path.join(self.path, file)
                     current_files.add(filepath)
-                    
-                    # Check if this is a new file or if enough time has passed since last check
                     current_time = time.time()
                     if filepath not in self._last_check:
                         self._last_check[filepath] = current_time
-                        # Simulate a file creation event
-                        event = FileCreatedEvent(filepath)
-                        self.handler.on_created(event)
-            
-            # Clean up old files from last_check
+                        if FileCreatedEvent:
+                            event = FileCreatedEvent(filepath)
+                            self.handler.on_created(event)
+                        else:
+                            if filepath not in self.handler.processing:
+                                self.handler.queue.put(filepath)
+                                self.handler.processing.add(filepath)
             for filepath in list(self._last_check.keys()):
                 if filepath not in current_files:
                     del self._last_check[filepath]
-                    
         except Exception as e:
             print(f"Error checking directory: {e}")
 
     def run(self):
         while not self._stop_event.is_set():
             self.check_directory()
-            time.sleep(1)  # Check every second
+            time.sleep(1)
 
 class Iso2GodGUI:
     def __init__(self):
         self.app = tk.Tk()
-        # Set window icon to icon.ico if available
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        self.app.title("ISO2GOD-RS GUI - Xbox 360 자동 변환기")
+        self.app.geometry("860x720")
+        self.app.minsize(780, 620)
+
+        # Apply Windows standard system fonts
         try:
-            if os.path.exists(icon_path):
-                self.app.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Warning: Could not set window icon: {e}")
-        self.app.title("ISO2GOD-rs GUI")
-        self.app.geometry("800x600")
-        
-        # Configure style
+            default_font = font.nametofont("TkDefaultFont")
+            default_font.configure(family="Malgun Gothic", size=9)
+            text_font = font.nametofont("TkTextFont")
+            text_font.configure(family="Malgun Gothic", size=9)
+            fixed_font = font.nametofont("TkFixedFont")
+            fixed_font.configure(family="Consolas", size=9)
+        except Exception:
+            pass
+
+        # Set Window Icon
+        self.set_app_icon()
+
+        # TTK Style configuration (Windows native 'vista' theme)
         self.style = ttk.Style()
-        self.style.configure('TFrame', padding=5)
-        self.style.configure('TButton', padding=5)
-        self.style.configure('TLabel', padding=5)
-        
-        # Queue for ISO files
+        try:
+            if "vista" in self.style.theme_names():
+                self.style.theme_use("vista")
+            elif "winnative" in self.style.theme_names():
+                self.style.theme_use("winnative")
+        except Exception:
+            pass
+
+        self.style.configure('TLabelframe', padding=8)
+        self.style.configure('TLabelframe.Label', font=("Malgun Gothic", 9, "bold"))
+        self.style.configure('Accent.TButton', font=("Malgun Gothic", 9, "bold"))
+
+        # Queue and processing state
         self.iso_queue = queue.Queue()
-        
-        # Processing flag
         self.is_processing = False
         self.watcher = None
         self.handler = None
-        
-        # Load saved settings
+        self.ftp = FTP()
+
+        # Load config
         self.config = self.load_config()
-        
-        # Find iso2god binaries
+
+        # Find binaries
         self.iso2god_binaries = self.find_iso2god_binaries()
         self.selected_iso2god = tk.StringVar()
-        # Set default selection from config or first found
-        if self.config.get("iso2god_binary") and self.config["iso2god_binary"] in self.iso2god_binaries:
-            self.selected_iso2god.set(self.config["iso2god_binary"])
+        saved_binary = self.config.get("iso2god_binary", "")
+        # Filter windows binaries
+        win_binaries = [b for b in self.iso2god_binaries if b.lower().startswith("windows") or b.lower().endswith(".exe")]
+
+        if saved_binary and saved_binary in self.iso2god_binaries:
+            if sys.platform == "win32" and not (saved_binary.lower().startswith("windows") or saved_binary.lower().endswith(".exe")) and win_binaries:
+                self.selected_iso2god.set(win_binaries[-1])
+            else:
+                self.selected_iso2god.set(saved_binary)
+        elif win_binaries and sys.platform == "win32":
+            self.selected_iso2god.set(win_binaries[-1])
         elif self.iso2god_binaries:
             self.selected_iso2god.set(self.iso2god_binaries[0])
         else:
             self.selected_iso2god.set("")
-        
-        # Create GUI elements
+
+        # Create GUI widgets
         self.create_widgets()
-        
-        # Start the processing thread
+
+        # Start background processor thread
         self.process_thread = threading.Thread(target=self.process_queue, daemon=True)
         self.process_thread.start()
 
-        # Add periodic check for GUI responsiveness
+        # Periodic responsiveness check
         self.check_gui_responsive()
 
-        # Show warning about missing iso2god binaries after all widgets are created
+        # Initial binary check warning
         if not self.iso2god_binaries:
-            self.update_status("Warning: No iso2god binaries found in ./iso2god folder!", "error")
+            self.update_status("경고: iso2god 실행 바이너리를 찾을 수 없습니다! (iso2god 폴더 확인 필요)", "error")
+        else:
+            self.update_status(f"프로그램 준비 완료. 감지된 엔진 바이너리 수: {len(self.iso2god_binaries)}개")
+
+    def set_app_icon(self):
+        # Look in bundle dir first, then app dir
+        icon_candidates = [
+            os.path.join(BUNDLE_DIR, "icon.ico"),
+            os.path.join(APP_DIR, "icon.ico"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        ]
+        for icon_path in icon_candidates:
+            if os.path.exists(icon_path):
+                try:
+                    self.app.iconbitmap(icon_path)
+                    break
+                except Exception:
+                    pass
 
     def check_gui_responsive(self):
-        """Periodic check to keep GUI responsive"""
         self.app.after(100, self.check_gui_responsive)
 
     def find_iso2god_binaries(self):
-        """Scan iso2god directory for binaries named <os>-<version>[.ext]"""
-        binaries = []
-        if not os.path.exists(ISO2GOD_DIR):
-            return binaries
-        # Accept patterns like windows-1.6.0, mac-1.6.0, linux-1.6.0, with or without .exe/.bin/.sh
-        pattern = re.compile(r'^(windows|mac|linux)-[\d.]+(\.[a-zA-Z0-9]+)?$')
-        for fname in os.listdir(ISO2GOD_DIR):
-            fpath = os.path.join(ISO2GOD_DIR, fname)
-            if os.path.isfile(fpath):
-                if pattern.match(fname):
-                    binaries.append(fname)
-        return sorted(binaries)
+        """Scan both external iso2god directory and bundled directory for executables."""
+        binaries = set()
+        search_dirs = [
+            os.path.join(APP_DIR, "iso2god"),
+            os.path.join(BUNDLE_DIR, "iso2god"),
+            APP_DIR,
+            BUNDLE_DIR
+        ]
+
+        pattern = re.compile(r'^(windows|mac|linux)-[\d.]+(\.[a-zA-Z0-9]+)?$', re.IGNORECASE)
+        for s_dir in search_dirs:
+            if os.path.exists(s_dir):
+                for fname in os.listdir(s_dir):
+                    fpath = os.path.join(s_dir, fname)
+                    if os.path.isfile(fpath):
+                        if pattern.match(fname) or fname.lower() in ("iso2god.exe", "iso2god"):
+                            binaries.add(fname)
+        return sorted(list(binaries))
+
+    def resolve_binary_path(self, binary_name):
+        """Find the full path of the given binary, checking user directory first, then bundle."""
+        candidates = [
+            os.path.join(APP_DIR, "iso2god", binary_name),
+            os.path.join(BUNDLE_DIR, "iso2god", binary_name),
+            os.path.join(APP_DIR, binary_name),
+            os.path.join(BUNDLE_DIR, binary_name)
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
 
     def load_config(self):
         try:
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r') as f:
-                    loaded_config = json.load(f)
-                    config = DEFAULT_CONFIG.copy()
-                    config.update(loaded_config)
-                    return config
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    cfg = DEFAULT_CONFIG.copy()
+                    cfg.update(loaded)
+                    return cfg
         except Exception as e:
-            self.update_status(f"Error loading config: {e}", "error")
+            print(f"Error loading config: {e}")
         return DEFAULT_CONFIG.copy()
 
     def save_config(self):
@@ -247,210 +313,523 @@ class Iso2GodGUI:
             "drv_name": self.drv_field.get()
         }
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(config, f, indent=4)
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            self.update_status(f"Error saving config: {e}", "error")
+            self.update_status(f"설정 저장 실패: {e}", "error")
 
     def create_widgets(self):
-        # Main container
-        main_container = ttk.Frame(self.app)
-        main_container.pack(fill="both", expand=True, padx=10, pady=5)
+        # Top-level container with margins
+        main = ttk.Frame(self.app, padding=(12, 10, 12, 10))
+        main.pack(fill="both", expand=True)
 
-        # Watch Directory Frame
-        watch_frame = ttk.Frame(main_container)
-        watch_frame.pack(fill="x", pady=5)
-        
-        ttk.Label(watch_frame, text="Watch Directory:").pack(side="left")
-        self.watch_path = ttk.Entry(watch_frame)
-        self.watch_path.pack(side="left", fill="x", expand=True, padx=5)
+        # ----------------------------------------------------
+        # 1. Directory Settings Group (폴더 경로 설정)
+        # ----------------------------------------------------
+        dir_group = ttk.LabelFrame(main, text=" 📁 폴더 경로 설정 ")
+        dir_group.pack(fill="x", pady=(0, 8))
+        dir_group.columnconfigure(1, weight=1)
+
+        # Watch Directory
+        ttk.Label(dir_group, text="감시 폴더 (ISO 위치):").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        self.watch_path = ttk.Entry(dir_group)
+        self.watch_path.grid(row=0, column=1, sticky="ew", padx=5, pady=4)
         self.watch_path.insert(0, self.config.get("watch_dir", ""))
-        
-        browse_btn = ttk.Button(watch_frame, text="Browse", command=self.browse_watch_dir)
-        browse_btn.pack(side="right")
+        self.watch_path.bind("<FocusOut>", lambda e: self.save_config())
+        ttk.Button(dir_group, text="찾아보기...", command=self.browse_watch_dir, width=12).grid(row=0, column=2, padx=4, pady=4)
 
-        # Output Directory Frame
-        output_frame = ttk.Frame(main_container)
-        output_frame.pack(fill="x", pady=5)
-        
-        ttk.Label(output_frame, text="Output Directory:").pack(side="left")
-        self.output_path = ttk.Entry(output_frame)
-        self.output_path.pack(side="left", fill="x", expand=True, padx=5)
+        # Output Directory
+        ttk.Label(dir_group, text="출력 폴더 (GOD 저장):").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        self.output_path = ttk.Entry(dir_group)
+        self.output_path.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
         self.output_path.insert(0, self.config.get("output_dir", ""))
-        
-        browse_output_btn = ttk.Button(output_frame, text="Browse", command=self.browse_output_dir)
-        browse_output_btn.pack(side="right")
+        self.output_path.bind("<FocusOut>", lambda e: self.save_config())
 
-        # Iso2God Binary Selection Frame
-        iso2god_frame = ttk.Frame(main_container)
-        iso2god_frame.pack(fill="x", pady=5)
-        ttk.Label(iso2god_frame, text="iso2god Version:").pack(side="left")
-        self.iso2god_dropdown = ttk.Combobox(iso2god_frame, textvariable=self.selected_iso2god, values=self.iso2god_binaries, state="readonly", width=40)
-        self.iso2god_dropdown.pack(side="left", padx=5, fill="x", expand=True)
+        out_btn_frame = ttk.Frame(dir_group)
+        out_btn_frame.grid(row=1, column=2, sticky="ew", padx=4, pady=4)
+        ttk.Button(out_btn_frame, text="찾아보기...", command=self.browse_output_dir, width=12).pack(side="left")
+        ttk.Button(out_btn_frame, text="폴더 열기", command=self.open_output_dir, width=10).pack(side="left", padx=(4, 0))
+
+        # ----------------------------------------------------
+        # 2. Conversion Options Group (변환 엔진 및 성능 옵션)
+        # ----------------------------------------------------
+        opt_group = ttk.LabelFrame(main, text=" ⚙️ 변환 옵션 및 엔진 설정 ")
+        opt_group.pack(fill="x", pady=(0, 8))
+
+        # Row 1: Engine & Threads
+        row1 = ttk.Frame(opt_group)
+        row1.pack(fill="x", pady=3)
+
+        ttk.Label(row1, text="변환 엔진 버전:").pack(side="left", padx=(5, 3))
+        self.iso2god_dropdown = ttk.Combobox(
+            row1, textvariable=self.selected_iso2god, values=self.iso2god_binaries, state="readonly", width=26
+        )
+        self.iso2god_dropdown.pack(side="left", padx=(0, 15))
         self.iso2god_dropdown.bind("<<ComboboxSelected>>", lambda e: self.save_config())
 
-        # Settings Frame
-        settings_frame = ttk.Frame(main_container)
-        settings_frame.pack(fill="x", pady=5)
+        ttk.Label(row1, text="작업 스레드 수:").pack(side="left", padx=(0, 3))
+        self.thread_count = ttk.Entry(row1, width=5)
+        self.thread_count.insert(0, str(self.config.get("thread_count", "4")))
+        self.thread_count.pack(side="left", padx=(0, 15))
+        self.thread_count.bind("<FocusOut>", lambda e: self.save_config())
 
-        # Left side settings
-        left_settings = ttk.Frame(settings_frame)
-        left_settings.pack(side="left", fill="x", expand=True)
+        ttk.Label(row1, text="스캔 지연 (초):").pack(side="left", padx=(0, 3))
+        self.scan_delay = ttk.Entry(row1, width=5)
+        self.scan_delay.insert(0, str(self.config.get("scan_delay", "2")))
+        self.scan_delay.pack(side="left", padx=(0, 15))
+        self.scan_delay.bind("<FocusOut>", lambda e: self.save_config())
 
-        # Thread Count Option
-        thread_frame = ttk.Frame(left_settings)
-        thread_frame.pack(side="left", padx=5)
-        ttk.Label(thread_frame, text="Threads:").pack(side="left")
-        self.thread_count = ttk.Entry(thread_frame, width=5)
-        self.thread_count.insert(0, self.config.get("thread_count", "4"))
-        self.thread_count.pack(side="left", padx=2)
+        ttk.Label(row1, text="타임아웃 (분, 0=무제한):").pack(side="left", padx=(0, 3))
+        self.process_timeout = ttk.Entry(row1, width=5)
+        self.process_timeout.insert(0, str(self.config.get("process_timeout", "0")))
+        self.process_timeout.pack(side="left")
+        self.process_timeout.bind("<FocusOut>", lambda e: self.save_config())
 
-        # Scan Delay Option
-        delay_frame = ttk.Frame(left_settings)
-        delay_frame.pack(side="left", padx=5)
-        ttk.Label(delay_frame, text="Scan Delay (sec):").pack(side="left")
-        self.scan_delay = ttk.Entry(delay_frame, width=5)
-        self.scan_delay.insert(0, self.config.get("scan_delay", "2"))
-        self.scan_delay.pack(side="left", padx=2)
+        # Row 2: Checkboxes
+        row2 = ttk.Frame(opt_group)
+        row2.pack(fill="x", pady=(4, 2))
 
-        # Process Timeout Option
-        timeout_frame = ttk.Frame(left_settings)
-        timeout_frame.pack(side="left", padx=5)
-        ttk.Label(timeout_frame, text="Process Timeout (min):").pack(side="left")
-        self.process_timeout = ttk.Entry(timeout_frame, width=5)
-        self.process_timeout.insert(0, self.config.get("process_timeout", "0"))
-        self.process_timeout.pack(side="left", padx=2)
-        ttk.Label(timeout_frame, text="(0 = no timeout)").pack(side="left", padx=2)
-
-        # Checkboxes Frame
-        checkbox_frame = ttk.Frame(main_container)
-        checkbox_frame.pack(fill="x", pady=5)
-
-        # Trim Option
         self.trim_var = tk.BooleanVar(value=self.config.get("trim_unused", False))
-        trim_check = ttk.Checkbutton(checkbox_frame, text="Trim unused space", variable=self.trim_var)
-        trim_check.pack(side="left", padx=5)
+        ttk.Checkbutton(row2, text="빈 공간 제거 (Trim unused space)", variable=self.trim_var, command=self.save_config).pack(side="left", padx=(5, 20))
 
-        # Delete ISO Option
         self.delete_iso_var = tk.BooleanVar(value=self.config.get("delete_iso", True))
-        delete_check = ttk.Checkbutton(checkbox_frame, text="Delete ISO after conversion", variable=self.delete_iso_var)
-        delete_check.pack(side="left", padx=5)
+        ttk.Checkbutton(row2, text="변환 완료 후 원본 ISO 삭제", variable=self.delete_iso_var, command=self.save_config).pack(side="left", padx=(0, 20))
 
-        # Send on FTP Option
+        # ----------------------------------------------------
+        # 3. FTP Transfer Group (FTP 자동 전송 설정)
+        # ----------------------------------------------------
+        ftp_group = ttk.LabelFrame(main, text=" 📡 FTP 콘솔 자동 전송 ")
+        ftp_group.pack(fill="x", pady=(0, 8))
+
+        ftp_head = ttk.Frame(ftp_group)
+        ftp_head.pack(fill="x", pady=(0, 4))
         self.use_ftp = tk.BooleanVar(value=self.config.get("use_ftp", False))
-        ftp_check = ttk.Checkbutton(checkbox_frame, text="FTP Transfer", variable=self.use_ftp)
-        ftp_check.pack(side="left", padx=5)
+        ttk.Checkbutton(
+            ftp_head, 
+            text="변환 완료 시 Xbox 콘솔로 자동 FTP 전송 활성화", 
+            variable=self.use_ftp, 
+            command=self.toggle_ftp_fields
+        ).pack(side="left", padx=5)
 
-        ftp_frame = ttk.Frame(main_container)
-        ftp_frame.pack(fill="x", pady=5)
+        self.ftp_inputs_frame = ttk.Frame(ftp_group)
+        self.ftp_inputs_frame.pack(fill="x", padx=5, pady=2)
 
-        self.ftp_ip = ttk.Entry(ftp_frame, width=15)
-        self.ftp_ip.pack(side="left", fill="x", padx=5)
-        ip_address = self.config.get("ip_addr", "IP Address") or "IP Address"
-        self.ftp_ip.insert(0, ip_address)
-        self.ftp_ip.config(foreground="gray" if ip_address == "IP Address" else "black")
-        self.ftp_ip.bind("<FocusIn>", lambda e: (
-            self.ftp_ip.delete(0, tk.END) if self.ftp_ip.get() == "IP Address" else None,
-            self.ftp_ip.config(foreground="black")
-        ))
-        self.ftp_ip.bind("<FocusOut>", lambda e: (
-            self.ftp_ip.insert(0, "IP Address") if not self.ftp_ip.get() else None,
-            self.ftp_ip.config(foreground="gray" if self.ftp_ip.get() == "IP Address" else "black")
-        ))
+        ttk.Label(self.ftp_inputs_frame, text="IP 주소:").grid(row=0, column=0, sticky="w", padx=3, pady=2)
+        self.ftp_ip = ttk.Entry(self.ftp_inputs_frame, width=15)
+        self.ftp_ip.grid(row=0, column=1, sticky="w", padx=3, pady=2)
+        self.ftp_ip.insert(0, self.config.get("ip_addr", ""))
+        self.ftp_ip.bind("<FocusOut>", lambda e: self.save_config())
 
-        self.ftp_user = ttk.Entry(ftp_frame, width=20)
-        self.ftp_user.pack(side="left", fill="x", padx=5)
-        user_value = self.config.get("ftp_user", "Username") or "Username"
-        self.ftp_user.insert(0, user_value)
-        self.ftp_user.config(foreground="gray" if user_value == "Username" else "black")
-        self.ftp_user.bind("<FocusIn>", lambda e: (
-            self.ftp_user.delete(0, tk.END) if self.ftp_user.get() == "Username" else None,
-            self.ftp_user.config(foreground="black")
-        ))
-        self.ftp_user.bind("<FocusOut>", lambda e: (
-            self.ftp_user.insert(0, "Username") if not self.ftp_user.get() else None,
-            self.ftp_user.config(foreground="gray" if self.ftp_user.get() == "Username" else "black")
-        ))
+        ttk.Label(self.ftp_inputs_frame, text="포트:").grid(row=0, column=2, sticky="w", padx=(10, 3), pady=2)
+        self.ftp_port = ttk.Entry(self.ftp_inputs_frame, width=6)
+        self.ftp_port.grid(row=0, column=3, sticky="w", padx=3, pady=2)
+        self.ftp_port.insert(0, str(self.config.get("ftp_port", "21") or "21"))
+        self.ftp_port.bind("<FocusOut>", lambda e: self.save_config())
 
-        self.ftp_pass = ttk.Entry(ftp_frame)
-        self.ftp_pass.pack(side="left", fill="x", padx=5)
-        pass_value = self.config.get("ftp_pass", "Password") or "Password"
-        self.ftp_pass.insert(0, pass_value)
-        self.ftp_pass.config(foreground="gray" if self.ftp_pass.get() == "Password" else "black",
-                                show="" if self.ftp_pass.get() == "Password" else "*")
-        self.ftp_pass.bind("<FocusIn>", lambda e: (
-            self.ftp_pass.delete(0, tk.END) if self.ftp_pass.get() == "Password" else None,
-            self.ftp_pass.config(foreground="black", show="*" if self.ftp_pass.get() != "Password" else "")
-        ))
-        self.ftp_pass.bind("<FocusOut>", lambda e: (
-            self.ftp_pass.insert(0, "Password") if not self.ftp_pass.get() else None,
-            self.ftp_pass.config(foreground="gray" if self.ftp_pass.get() == "Password" else "black",
-                                show="" if self.ftp_pass.get() == "Password" else "*")
-        ))
+        ttk.Label(self.ftp_inputs_frame, text="사용자명:").grid(row=0, column=4, sticky="w", padx=(10, 3), pady=2)
+        self.ftp_user = ttk.Entry(self.ftp_inputs_frame, width=12)
+        self.ftp_user.grid(row=0, column=5, sticky="w", padx=3, pady=2)
+        self.ftp_user.insert(0, self.config.get("ftp_user", "xbox"))
+        self.ftp_user.bind("<FocusOut>", lambda e: self.save_config())
 
-        self.ftp_port = ttk.Entry(ftp_frame, width=17)
-        self.ftp_port.pack(side="left", fill="x", padx=5)
-        port_value = self.config.get("ftp_port", "Port (default: 21)") or "Port (default: 21)"
-        self.ftp_port.insert(0, port_value)
-        self.ftp_port.config(foreground="gray" if port_value == "Port (default: 21)" else "black")
-        self.ftp_port.bind("<FocusIn>", lambda e: (
-            self.ftp_port.delete(0, tk.END) if self.ftp_port.get() == "Port (default: 21)" else None,
-            self.ftp_port.config(foreground="black")
-        ))
-        self.ftp_port.bind("<FocusOut>", lambda e: (
-            self.ftp_port.insert(0, "Port (default: 21)") if not self.ftp_port.get() else None,
-            self.ftp_port.config(foreground="gray" if self.ftp_port.get() == "Port (default: 21)" else "black")
-        ))
+        ttk.Label(self.ftp_inputs_frame, text="비밀번호:").grid(row=0, column=6, sticky="w", padx=(10, 3), pady=2)
+        self.ftp_pass = ttk.Entry(self.ftp_inputs_frame, width=12, show="*")
+        self.ftp_pass.grid(row=0, column=7, sticky="w", padx=3, pady=2)
+        self.ftp_pass.insert(0, self.config.get("ftp_pass", "xbox"))
+        self.ftp_pass.bind("<FocusOut>", lambda e: self.save_config())
 
-        self.drv_field = ttk.Entry(ftp_frame, width=30)
-        self.drv_field.pack(side="left", fill="x", padx=5)
-        user_value = self.config.get("drv_name", "Drive Folder (default: Hdd1)") or "Drive Folder (default: Hdd1)"
-        self.drv_field.insert(0, user_value)
-        self.drv_field.config(foreground="gray" if user_value == "Drive Folder (default: Hdd1)" else "black")
-        self.drv_field.bind("<FocusIn>", lambda e: (
-            self.drv_field.delete(0, tk.END) if self.drv_field.get() == "Drive Folder (default: Hdd1)" else None,
-            self.drv_field.config(foreground="black")
-        ))
-        self.drv_field.bind("<FocusOut>", lambda e: (
-            self.drv_field.insert(0, "Drive Folder (default: Hdd1)") if not self.drv_field.get() else None,
-            self.drv_field.config(foreground="gray" if self.drv_field.get() == "Drive Folder (default: Hdd1)" else "black")
-        ))
+        ttk.Label(self.ftp_inputs_frame, text="드라이브명:").grid(row=0, column=8, sticky="w", padx=(10, 3), pady=2)
+        self.drv_field = ttk.Entry(self.ftp_inputs_frame, width=8)
+        self.drv_field.grid(row=0, column=9, sticky="w", padx=3, pady=2)
+        self.drv_field.insert(0, self.config.get("drv_name", "Hdd1") or "Hdd1")
+        self.drv_field.bind("<FocusOut>", lambda e: self.save_config())
 
-        # Current Game Title Display (Read-only)
-        game_frame = ttk.Frame(main_container)
-        game_frame.pack(fill="x", pady=5)
-        ttk.Label(game_frame, text="Current Game:").pack(side="left")
-        self.game_title_var = tk.StringVar(value="None")
-        self.game_title_display = ttk.Entry(game_frame, textvariable=self.game_title_var, state="readonly")
-        self.game_title_display.pack(side="left", fill="x", expand=True, padx=5)
+        self.toggle_ftp_fields()
 
-        # Control Buttons Frame
-        control_frame = ttk.Frame(main_container)
-        control_frame.pack(fill="x", pady=5)
+        # ----------------------------------------------------
+        # 4. Status & Control Group (진행 상태 및 제어)
+        # ----------------------------------------------------
+        status_box = ttk.LabelFrame(main, text=" 🎮 작업 진행 및 상태 ")
+        status_box.pack(fill="x", pady=(0, 8))
 
-        self.start_btn = ttk.Button(control_frame, text="Start Conversion", command=self.toggle_watching)
-        self.start_btn.pack(side="left", padx=5)
+        # Current game row
+        game_row = ttk.Frame(status_box)
+        game_row.pack(fill="x", pady=(2, 6))
+        ttk.Label(game_row, text="현재 변환 게임:", font=("Malgun Gothic", 9, "bold")).pack(side="left", padx=(5, 5))
+        self.game_title_var = tk.StringVar(value="없음 (대기 중)")
+        self.game_title_label = ttk.Label(game_row, textvariable=self.game_title_var, foreground="#005fb8", font=("Malgun Gothic", 10, "bold"))
+        self.game_title_label.pack(side="left", fill="x", expand=True)
 
-        self.clear_btn = ttk.Button(control_frame, text="Clear Queue", command=self.clear_queue)
-        self.clear_btn.pack(side="left", padx=5)
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(status_box, mode="indeterminate")
+        self.progress_bar.pack(fill="x", padx=5, pady=(0, 6))
 
-        # Status Bar
-        status_frame = ttk.Frame(main_container)
-        status_frame.pack(fill="x", pady=5)
-        
-        self.status_label = ttk.Label(status_frame, text="Status: Idle", font=("TkDefaultFont", 10, "bold"))
-        self.status_label.pack(side="left", fill="x", expand=True)
+        # Button Controls & Status text label
+        btn_bar = ttk.Frame(status_box)
+        btn_bar.pack(fill="x", pady=(2, 2))
 
-        # Status and Queue Display with better visibility
-        self.status_text = tk.Text(main_container, height=20, font=("Consolas", 10))
-        self.status_text.pack(fill="both", expand=True, pady=5)
-        self.status_text.tag_configure("found", foreground="blue", font=("Consolas", 10, "bold"))
-        self.status_text.tag_configure("success", foreground="green", font=("Consolas", 10, "bold"))
-        self.status_text.tag_configure("error", foreground="red", font=("Consolas", 10, "bold"))
+        self.start_btn = ttk.Button(btn_bar, text="▶ 변환 및 감시 시작", command=self.toggle_watching, width=18, style="Accent.TButton")
+        self.start_btn.pack(side="left", padx=(5, 6))
+
+        self.clear_btn = ttk.Button(btn_bar, text="대기열 비우기", command=self.clear_queue, width=14)
+        self.clear_btn.pack(side="left", padx=4)
+
+        self.status_label = ttk.Label(btn_bar, text="상태: 대기 중", font=("Malgun Gothic", 9))
+        self.status_label.pack(side="left", padx=(15, 5), fill="x", expand=True)
+
+        # ----------------------------------------------------
+        # 5. Log Console (작업 로그)
+        # ----------------------------------------------------
+        log_group = ttk.LabelFrame(main, text=" 📜 실시간 로그 ")
+        log_group.pack(fill="both", expand=True)
+
+        self.status_text = scrolledtext.ScrolledText(
+            log_group, 
+            height=12, 
+            font=("Consolas", 9), 
+            wrap="word", 
+            background="#ffffff", 
+            foreground="#1e1e1e"
+        )
+        self.status_text.pack(fill="both", expand=True, padx=4, pady=4)
+        self.status_text.tag_configure("found", foreground="#0052cc", font=("Consolas", 9, "bold"))
+        self.status_text.tag_configure("success", foreground="#008000", font=("Consolas", 9, "bold"))
+        self.status_text.tag_configure("error", foreground="#d90000", font=("Consolas", 9, "bold"))
+        self.status_text.tag_configure("watching", foreground="#006699")
         self.status_text.configure(state="disabled")
 
+    def toggle_ftp_fields(self):
+        state = "normal" if self.use_ftp.get() else "disabled"
+        for child in self.ftp_inputs_frame.winfo_children():
+            if isinstance(child, ttk.Entry):
+                child.configure(state=state)
+        self.save_config()
 
-    ftp = FTP()
+    def browse_watch_dir(self):
+        directory = filedialog.askdirectory(title="감시할 ISO 폴더 선택", initialdir=self.watch_path.get() or APP_DIR)
+        if directory:
+            self.watch_path.delete(0, "end")
+            self.watch_path.insert(0, directory)
+            self.save_config()
+
+    def browse_output_dir(self):
+        directory = filedialog.askdirectory(title="GOD 파일 저장 폴더 선택", initialdir=self.output_path.get() or APP_DIR)
+        if directory:
+            self.output_path.delete(0, "end")
+            self.output_path.insert(0, directory)
+            self.save_config()
+
+    def open_output_dir(self):
+        out_dir = self.output_path.get()
+        if out_dir and os.path.exists(out_dir):
+            try:
+                os.startfile(out_dir)
+            except Exception as e:
+                messagebox.showerror("오류", f"폴더를 열 수 없습니다: {e}")
+        else:
+            messagebox.showwarning("안내", "유효한 출력 폴더를 먼저 선택해 주세요.")
+
+    def update_status(self, message, status_type=None, current_index=None, total_count=None):
+        self.status_text.configure(state="normal")
+        timestamp = time.strftime("%H:%M:%S")
+        queue_info = ""
+        if current_index is not None and total_count is not None:
+            queue_info = f" ({total_count}개 중 {current_index}번째 처리 중)"
+
+        if status_type == "found":
+            self.status_label.configure(text=f"상태: ISO 발견 - {os.path.basename(message)}{queue_info}")
+        elif status_type == "success":
+            self.status_label.configure(text=f"상태: 변환 완료{queue_info}")
+        elif status_type == "error":
+            self.status_label.configure(text=f"상태: 오류 발생{queue_info}")
+        elif status_type == "watching":
+            self.status_label.configure(text=f"상태: 폴더 감시 중 - {message}{queue_info}")
+        else:
+            self.status_label.configure(text=f"상태: {message}{queue_info}")
+
+        prefix = f"[{timestamp}] "
+        if status_type:
+            self.status_text.insert("end", prefix)
+            self.status_text.insert("end", f"{message}{queue_info}\n", status_type)
+        else:
+            self.status_text.insert("end", f"{prefix}{message}{queue_info}\n")
+
+        self.status_text.see("end")
+        self.status_text.configure(state="disabled")
+
+    def toggle_watching(self):
+        if not self.watcher:
+            try:
+                watch_dir = self.watch_path.get().strip()
+                output_dir = self.output_path.get().strip()
+
+                if not watch_dir or not output_dir:
+                    messagebox.showerror("오류", "감시 폴더와 출력 폴더를 모두 지정해 주세요.")
+                    return
+
+                if not os.path.exists(watch_dir):
+                    messagebox.showerror("오류", f"감시 폴더가 존재하지 않습니다:\n{watch_dir}")
+                    return
+
+                if not os.path.exists(output_dir):
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                    except Exception as e:
+                        messagebox.showerror("오류", f"출력 폴더 생성 실패:\n{e}")
+                        return
+
+                self.save_config()
+                self.handler = IsoHandler(self.iso_queue)
+
+                try:
+                    delay = float(self.scan_delay.get())
+                    self.handler.set_scan_delay(delay)
+                except ValueError:
+                    self.scan_delay.delete(0, "end")
+                    self.scan_delay.insert(0, "2")
+                    self.handler.set_scan_delay(2.0)
+
+                self.watcher = DirectoryWatcher(watch_dir, self.handler)
+                self.watcher.start()
+
+                self.start_btn.configure(text="⏹ 감시 및 변환 중지")
+                self.progress_bar.start(15)
+                self.update_status(f"감시 시작: {watch_dir}", "watching")
+                self.is_processing = True
+
+            except Exception as e:
+                self.update_status(f"감시 시작 오류: {str(e)}", "error")
+                if self.watcher:
+                    try:
+                        self.watcher.stop()
+                    except Exception:
+                        pass
+                self.watcher = None
+                self.progress_bar.stop()
+                messagebox.showerror("오류", f"변환 작업을 시작하지 못했습니다: {str(e)}")
+        else:
+            self.stop_watching()
+
+    def stop_watching(self):
+        if self.watcher:
+            try:
+                self.watcher.stop()
+                self.watcher = None
+                self.start_btn.configure(text="▶ 변환 및 감시 시작")
+                self.progress_bar.stop()
+                self.update_status("폴더 감시가 중지되었습니다.")
+                self.is_processing = False
+            except Exception as e:
+                self.update_status(f"감시 중지 오류: {str(e)}", "error")
+
+    def clear_queue(self):
+        cleared_count = 0
+        while not self.iso_queue.empty():
+            try:
+                self.iso_queue.get_nowait()
+                cleared_count += 1
+            except queue.Empty:
+                break
+        self.update_status(f"대기열 비움 완료 ({cleared_count}개 삭제)")
+
+    def process_queue(self):
+        while True:
+            if self.is_processing:
+                try:
+                    total_count = self.iso_queue.qsize()
+                    if total_count == 0:
+                        time.sleep(0.1)
+                        continue
+                    current_index = 1
+                    iso_path = self.iso_queue.get(timeout=1)
+                    self.process_iso(iso_path, current_index=current_index, total_count=total_count)
+                except queue.Empty:
+                    time.sleep(0.1)
+            else:
+                time.sleep(0.1)
+
+    def process_iso(self, iso_path, current_index=None, total_count=None):
+        max_retries = 3
+        retry_delay = 10
+        current_try = 0
+        last_progress_time = 0
+        progress_update_interval = 5
+
+        def is_legacy_version(binary_name):
+            m = re.search(r'-(\d+\.\d+\.\d+)', binary_name)
+            if m:
+                version = m.group(1)
+                version_tuple = tuple(map(int, version.split('.')))
+                return version_tuple <= (1, 6, 0)
+            return False
+
+        try:
+            filename = os.path.basename(iso_path)
+            game_title = os.path.splitext(filename)[0]
+            self.game_title_var.set(game_title)
+            self.update_status(f"새 ISO 감지: {filename}", "found", current_index=current_index, total_count=total_count)
+
+            iso2god_binary = self.selected_iso2god.get()
+            if not iso2god_binary:
+                self.update_status("선택된 iso2god 바이너리가 없습니다!", "error")
+                return
+
+            iso2god_path = self.resolve_binary_path(iso2god_binary)
+            if not iso2god_path or not os.path.exists(iso2god_path):
+                self.update_status(f"iso2god 실행 파일을 찾을 수 없습니다: {iso2god_binary}", "error")
+                return
+
+            legacy_mode = is_legacy_version(iso2god_binary)
+
+            while current_try < max_retries:
+                try:
+                    # Check file access
+                    try:
+                        with open(iso_path, 'rb') as test_file:
+                            pass
+                    except PermissionError:
+                        if current_try < max_retries - 1:
+                            self.update_status(f"파일이 잠겨 있습니다. {retry_delay}초 후 재시도... (시도 {current_try + 1}/{max_retries})", "error", current_index=current_index, total_count=total_count)
+                            time.sleep(retry_delay)
+                            current_try += 1
+                            continue
+                        else:
+                            self.update_status(f"{filename} 건너뜀 - 파일 잠금 해제 실패", "error", current_index=current_index, total_count=total_count)
+                            return
+
+                    cmd = [iso2god_path, iso_path, self.output_path.get()]
+                    if self.trim_var.get():
+                        cmd.append("--trim")
+
+                    thread_count = self.thread_count.get().strip()
+                    add_j = thread_count.isdigit() and not legacy_mode
+                    if add_j:
+                        cmd.extend(["-j", thread_count])
+
+                    try:
+                        timeout_minutes = float(self.process_timeout.get())
+                        timeout_seconds = timeout_minutes * 60 if timeout_minutes > 0 else None
+                    except ValueError:
+                        timeout_seconds = None
+
+                    self.update_status(f"변환 시작: {filename} (엔진: {iso2god_binary})", current_index=current_index, total_count=total_count)
+
+                    # Windows: Hide child console window if GUI frozen
+                    startupinfo = None
+                    if sys.platform == "win32":
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        startupinfo=startupinfo
+                    )
+
+                    last_output = ""
+                    conversion_start_time = time.time()
+                    error_detected = {"unexpected_j": False}
+
+                    def read_output(pipe, is_error=False):
+                        nonlocal last_output
+                        while True:
+                            line = pipe.readline()
+                            if not line:
+                                break
+                            line = line.strip()
+                            if line:
+                                if is_error and legacy_mode and "unexpected argument '-j' found" in line:
+                                    error_detected["unexpected_j"] = True
+                                if "writing part files:" in line.lower() or "progress" in line.lower():
+                                    self.status_label.configure(text=f"상태: {line}")
+                                self.update_status(line, "error" if is_error else None)
+                                if not is_error:
+                                    last_output = line
+
+                    stdout_thread = threading.Thread(target=read_output, args=(process.stdout,))
+                    stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
+                    stdout_thread.daemon = True
+                    stderr_thread.daemon = True
+                    stdout_thread.start()
+                    stderr_thread.start()
+
+                    while process.poll() is None:
+                        current_time = time.time()
+                        if timeout_seconds and current_time - conversion_start_time > timeout_seconds:
+                            process.terminate()
+                            time.sleep(1)
+                            if process.poll() is None:
+                                process.kill()
+                            self.update_status(f"{filename} 변환 중단 - {timeout_minutes}분 타임아웃 초과", "error", current_index=current_index, total_count=total_count)
+                            return
+
+                        if current_time - last_progress_time >= progress_update_interval:
+                            elapsed_minutes = (current_time - conversion_start_time) / 60
+                            self.status_label.configure(text=f"진행 중: {filename} ({int(elapsed_minutes)}분 경과)")
+                            last_progress_time = current_time
+
+                        time.sleep(0.1)
+
+                    return_code = process.poll()
+                    stdout_thread.join(1)
+                    stderr_thread.join(1)
+
+                    if legacy_mode and error_detected["unexpected_j"] and add_j:
+                        self.update_status("레거시 엔진 감지: '-j' 옵션 없이 재시도합니다...", "error", current_index=current_index, total_count=total_count)
+                        current_try += 1
+                        continue
+
+                    if return_code == 0:
+                        elapsed_minutes = (time.time() - conversion_start_time) / 60
+                        self.update_status(
+                            f"변환 완료 성공: {filename} (총 소요 시간: {int(elapsed_minutes)}분 {int((elapsed_minutes % 1)*60)}초)", 
+                            "success", current_index=current_index, total_count=total_count
+                        )
+                        if self.delete_iso_var.get() and self.is_processing:
+                            try:
+                                os.remove(iso_path)
+                                self.update_status(f"원본 ISO 파일 삭제 완료: {filename}", "success")
+                            except Exception as e:
+                                self.update_status(f"원본 ISO 삭제 실패: {e}", "error")
+                        return
+                    else:
+                        error_msg = f"{filename} 변환 실패 (코드: {return_code})"
+                        if current_try < max_retries - 1:
+                            self.update_status(f"{error_msg}. {retry_delay}초 후 재시도... (시도 {current_try + 1}/{max_retries})", "error", current_index=current_index, total_count=total_count)
+                            time.sleep(retry_delay)
+                            current_try += 1
+                        else:
+                            self.update_status(f"{filename} 변환 최종 실패", "error", current_index=current_index, total_count=total_count)
+                            return
+                except PermissionError as e:
+                    if current_try < max_retries - 1:
+                        self.update_status(f"파일 접근 오류: {e}. {retry_delay}초 후 재시도...", "error")
+                        time.sleep(retry_delay)
+                        current_try += 1
+                    else:
+                        self.update_status(f"{filename} 파일 접근 불가로 건너뜁니다: {e}", "error")
+                        return
+                except Exception as e:
+                    self.update_status(f"예상치 못한 오류: {e}", "error")
+                    return
+        finally:
+            self.game_title_var.set("없음 (대기 중)")
+            if iso_path in self.handler.processing:
+                self.handler.processing.remove(iso_path)
+            self.iso_queue.task_done()
+
+            # FTP Transfer if enabled
+            if self.use_ftp.get():
+                try:
+                    self.update_status("Xbox 콘솔로 FTP 전송을 시작합니다...")
+                    self.send_over_ftp()
+                except Exception as e:
+                    self.update_status(f"FTP 전송 실패: {e}", "error")
+
+            self.update_status("다음 작업 대기 중", current_index=current_index, total_count=total_count)
 
     def upload_file_with_progress(self, local_path, remote_name):
         total_size = os.path.getsize(local_path)
@@ -458,13 +837,12 @@ class Iso2GodGUI:
         last_percent = 0
 
         def callback(data):
-            nonlocal uploaded
-            nonlocal last_percent
+            nonlocal uploaded, last_percent
             uploaded += len(data)
-            percent = int(uploaded / total_size * 100)
+            percent = int((uploaded / total_size) * 100) if total_size > 0 else 100
             if percent >= last_percent + 10:
                 last_percent = (percent // 10) * 10
-                self.update_status(f"\rUploading {remote_name}: {percent:.2f}%")
+                self.status_label.configure(text=f"FTP 업로드 중: {remote_name} ({percent}%)")
 
         with open(local_path, "rb") as f:
             self.ftp.storbinary(f"STOR {remote_name}", f, 1024, callback=callback)
@@ -472,7 +850,7 @@ class Iso2GodGUI:
     def upload_folder(self, local_dir, remote_dir):
         try:
             self.ftp.mkd(remote_dir)
-        except:
+        except Exception:
             pass
         self.ftp.cwd(remote_dir)
 
@@ -484,347 +862,24 @@ class Iso2GodGUI:
             else:
                 self.upload_file_with_progress(local_path, item)
 
-        self.update_status("FTP Transfer Complete!")
-
     def send_over_ftp(self):
-        self.ftp.connect(self.ftp_ip.get(), 21 if self.ftp_port.get() == "Port (default: 21)" else int(self.ftp_port.get()))
-        self.ftp.login(self.ftp_user.get(), self.ftp_pass.get())
-        local_folder = self.output_path.get()     
-        remote_folder = ("Hdd1" if self.drv_field.get() == "Drive Folder (default: Hdd1)" else self.drv_field.get())+"/Content/0000000000000000"
+        ip = self.ftp_ip.get().strip()
+        port = int(self.ftp_port.get().strip() or "21")
+        user = self.ftp_user.get().strip()
+        pwd = self.ftp_pass.get().strip()
+        drv = self.drv_field.get().strip() or "Hdd1"
+        out_folder = self.output_path.get().strip()
 
-        self.upload_folder(local_folder, remote_folder)
+        if not ip:
+            self.update_status("FTP 전송 실패: IP 주소가 입력되지 않았습니다.", "error")
+            return
 
-    def browse_watch_dir(self):
-        directory = filedialog.askdirectory()
-        if directory:
-            self.watch_path.delete(0, "end")
-            self.watch_path.insert(0, directory)
-            self.save_config()
-
-    def browse_output_dir(self):
-        directory = filedialog.askdirectory()
-        if directory:
-            self.output_path.delete(0, "end")
-            self.output_path.insert(0, directory)
-            self.save_config()
-
-    def update_status(self, message, status_type=None, current_index=None, total_count=None):
-        """Update both the status bar and the status text area, with optional queue info"""
-        self.status_text.configure(state="normal")
-        timestamp = time.strftime("%H:%M:%S")
-
-        # Add queue info to the message if provided
-        queue_info = ""
-        if current_index is not None and total_count is not None:
-            queue_info = f" (Processing {current_index} of {total_count})"
-
-        # Update status label
-        if status_type == "found":
-            self.status_label.configure(text=f"Status: ISO Found - {os.path.basename(message)}{queue_info}")
-        elif status_type == "success":
-            self.status_label.configure(text=f"Status: Conversion Complete{queue_info}")
-        elif status_type == "error":
-            self.status_label.configure(text=f"Status: Error Occurred{queue_info}")
-        elif status_type == "watching":
-            self.status_label.configure(text=f"Status: Watching - {message}{queue_info}")
-        else:
-            self.status_label.configure(text=f"Status: {message}{queue_info}")
-
-        # Add message to text area with appropriate tag
-        if status_type:
-            self.status_text.insert("end", f"{timestamp} - ", "")
-            self.status_text.insert("end", f"{message}{queue_info}\n", status_type)
-        else:
-            self.status_text.insert("end", f"{timestamp} - {message}{queue_info}\n")
-
-        self.status_text.see("end")
-        self.status_text.configure(state="disabled")
-
-    def toggle_watching(self):
-        if not self.watcher:
-            try:
-                watch_dir = self.watch_path.get()
-                output_dir = self.output_path.get()
-                
-                if not watch_dir or not output_dir:
-                    messagebox.showerror("Error", "Please select both watch and output directories")
-                    return
-                    
-                if not os.path.exists(watch_dir) or not os.path.exists(output_dir):
-                    messagebox.showerror("Error", "One or both directories do not exist")
-                    return
-
-                # Save current settings
-                self.save_config()
-
-                self.handler = IsoHandler(self.iso_queue)
-                
-                # Update scan delay from UI
-                try:
-                    scan_delay = float(self.scan_delay.get())
-                    self.handler.set_scan_delay(scan_delay)
-                except ValueError:
-                    messagebox.showwarning("Warning", "Invalid scan delay value. Using default (2 seconds)")
-                    self.scan_delay.delete(0, "end")
-                    self.scan_delay.insert(0, "2")
-                    self.handler.set_scan_delay(2.0)
-
-                self.watcher = DirectoryWatcher(watch_dir, self.handler)
-                self.watcher.start()
-                
-                self.start_btn.configure(text="Stop Watching")
-                self.update_status(watch_dir, "watching")
-                self.is_processing = True
-                
-            except Exception as e:
-                self.update_status(f"Error starting watcher: {str(e)}", "error")
-                if self.watcher:
-                    try:
-                        self.watcher.stop()
-                    except:
-                        pass
-                self.watcher = None
-                messagebox.showerror("Error", f"Failed to start converting: {str(e)}")
-        else:
-            self.stop_watching()
-
-    def stop_watching(self):
-        if self.watcher:
-            try:
-                self.watcher.stop()
-                self.watcher = None
-                self.start_btn.configure(text="Start Conversion")
-                self.update_status("Stopped watching")
-                self.is_processing = False
-            except Exception as e:
-                self.update_status(f"Error stopping watcher: {str(e)}", "error")
-                messagebox.showerror("Error", f"Error stopping watcher: {str(e)}")
-
-    def clear_queue(self):
-        while not self.iso_queue.empty():
-            try:
-                self.iso_queue.get_nowait()
-            except queue.Empty:
-                break
-        self.update_status("Queue cleared")
-
-    def process_queue(self):
-        while True:
-            if self.is_processing:
-                try:
-                    total_count = self.iso_queue.qsize()
-                    if total_count == 0:
-                        time.sleep(0.1)
-                        continue
-                    # Calculate the current index (1-based)
-                    current_index = total_count - self.iso_queue.qsize() + 1
-                    iso_path = self.iso_queue.get(timeout=1)
-                    self.process_iso(iso_path, current_index=current_index, total_count=total_count)
-                except queue.Empty:
-                    time.sleep(0.1)
-            else:
-                time.sleep(0.1)
-
-    def process_iso(self, iso_path, current_index=None, total_count=None):
-        max_retries = 3  # Maximum number of retry attempts
-        retry_delay = 120  # Delay between retries in seconds
-        current_try = 0
-        last_progress_time = 0  # Track last progress update
-        progress_update_interval = 10  # Update every 10 seconds
-        # --- v1.6.0 and below edge case support ---
-        def is_legacy_version(binary_name):
-            import re
-            m = re.search(r'-(\d+\.\d+\.\d+)', binary_name)
-            if m:
-                version = m.group(1)
-                # Compare as tuple of ints
-                version_tuple = tuple(map(int, version.split('.')))
-                return version_tuple <= (1, 6, 0)
-            return False
-        # --- end legacy support ---
-        try:
-            # Update the current game title display
-            filename = os.path.basename(iso_path)
-            game_title = os.path.splitext(filename)[0]
-            self.game_title_var.set(game_title)
-            self.update_status(f"Found new ISO: {filename}", "found", current_index=current_index, total_count=total_count)
-            # Get the path to iso2god binary from selection
-            iso2god_binary = self.selected_iso2god.get()
-            if not iso2god_binary:
-                self.update_status("No iso2god binary selected!", "error")
-                return
-            iso2god_path = os.path.join(ISO2GOD_DIR, iso2god_binary)
-            if not os.path.exists(iso2god_path):
-                self.update_status(f"iso2god binary not found: {iso2god_path}", "error")
-                return
-            legacy_mode = is_legacy_version(iso2god_binary)
-            while current_try < max_retries:
-                try:
-                    # Check if file is accessible before attempting conversion
-                    try:
-                        with open(iso_path, 'rb') as test_file:
-                            pass
-                    except PermissionError:
-                        if current_try < max_retries - 1:
-                            self.update_status(f"File {filename} is locked. Retrying in {retry_delay} seconds... (Attempt {current_try + 1}/{max_retries})", "error", current_index=current_index, total_count=total_count)
-                            time.sleep(retry_delay)
-                            current_try += 1
-                            continue
-                        else:
-                            self.update_status(f"Skipping {filename} - File remained locked after {max_retries} attempts", "error", current_index=current_index, total_count=total_count)
-                            return
-                    cmd = [iso2god_path, iso_path, self.output_path.get()]
-                    # Add optional arguments
-                    if self.trim_var.get():
-                        cmd.append("--trim")
-                    thread_count = self.thread_count.get()
-                    # Only add -j if not legacy
-                    add_j = thread_count.isdigit() and not legacy_mode
-                    if add_j:
-                        cmd.extend(["-j", thread_count])
-                    # Get timeout value in minutes (0 means no timeout)
-                    try:
-                        timeout_minutes = float(self.process_timeout.get())
-                        timeout_seconds = timeout_minutes * 60 if timeout_minutes > 0 else None
-                    except ValueError:
-                        timeout_seconds = None
-                        self.update_status("Invalid timeout value, proceeding without timeout", "error")
-                    self.update_status(f"Starting conversion of {filename}...", current_index=current_index, total_count=total_count)
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        bufsize=1  # Line buffered
-                    )
-                    # Store the last output line for progress updates
-                    last_output = ""
-                    conversion_start_time = time.time()
-                    # Use separate thread for reading output to prevent blocking
-                    error_detected = {"unexpected_j": False}
-                    def read_output(pipe, is_error=False):
-                        nonlocal last_output
-                        while True:
-                            line = pipe.readline()
-                            if not line:
-                                break
-                            line = line.strip()
-                            if line:
-                                # --- legacy error detection ---
-                                if is_error and legacy_mode and "unexpected argument '-j' found" in line:
-                                    error_detected["unexpected_j"] = True
-                                # --- end legacy error detection ---
-                                # Check for file access errors in the output
-                                if is_error and ("process cannot access the file" in line or 
-                                               "being used by another process" in line):
-                                    raise PermissionError(line)
-                                # Update progress immediately for part file updates
-                                if "writing part files:" in line:
-                                    self.status_label.configure(text=f"Status: {line}")
-                                    self.app.update_idletasks()
-                                self.update_status(line, "error" if is_error else None)
-                                if not is_error:
-                                    last_output = line
-                                # Keep GUI responsive
-                                self.app.update_idletasks()
-                    # Start output reader threads
-                    stdout_thread = threading.Thread(target=read_output, args=(process.stdout,))
-                    stderr_thread = threading.Thread(target=read_output, args=(process.stderr, True))
-                    stdout_thread.daemon = True
-                    stderr_thread.daemon = True
-                    stdout_thread.start()
-                    stderr_thread.start()
-                    # Wait for process with optional timeout and progress updates
-                    while process.poll() is None:
-                        current_time = time.time()
-                        # Check for timeout
-                        if timeout_seconds and current_time - conversion_start_time > timeout_seconds:
-                            process.terminate()
-                            time.sleep(1)
-                            if process.poll() is None:
-                                process.kill()
-                            self.update_status(f"Skipping {filename} - Process timed out after {timeout_minutes} minutes", "error", current_index=current_index, total_count=total_count)
-                            return
-                        # Only show elapsed time if we haven't seen a progress update recently
-                        if current_time - last_progress_time >= progress_update_interval and not "writing part files:" in last_output:
-                            elapsed_minutes = (current_time - conversion_start_time) / 60
-                            self.update_status(
-                                f"Converting {filename} - "
-                                f"Time elapsed: {int(elapsed_minutes)} minutes - "
-                                f"Last status: {last_output}", current_index=current_index, total_count=total_count
-                            )
-                            last_progress_time = current_time
-                        # Keep GUI responsive without consuming CPU
-                        self.app.update()
-                        time.sleep(0.1)  # Small sleep to prevent CPU spinning
-                    # Get final return code
-                    return_code = process.poll()
-                    # Wait for output threads to finish
-                    stdout_thread.join(1)
-                    stderr_thread.join(1)
-                    # --- legacy retry logic ---
-                    if legacy_mode and error_detected["unexpected_j"] and add_j:
-                        self.update_status("Detected '-j' error for legacy iso2god. Retrying without '-j'...", "error", current_index=current_index, total_count=total_count)
-                        legacy_mode = True  # Ensure legacy mode stays True
-                        current_try += 1
-                        continue  # Retry without -j
-                    # --- end legacy retry logic ---
-                    if return_code == 0:
-                        elapsed_minutes = (time.time() - conversion_start_time) / 60
-                        self.update_status(
-                            f"Successfully converted: {filename} "
-                            f"(Total time: {int(elapsed_minutes)} minutes)", 
-                            "success", current_index=current_index, total_count=total_count
-                        )
-                        # Delete the original ISO if option is enabled and still processing
-                        if self.delete_iso_var.get() and self.is_processing:
-                            try:
-                                os.remove(iso_path)
-                                self.update_status(f"Deleted original ISO: {filename}", "success", current_index=current_index, total_count=total_count)
-                            except Exception as e:
-                                self.update_status(f"Error deleting ISO {filename}: {str(e)}", "error", current_index=current_index, total_count=total_count)
-                        elif self.delete_iso_var.get() and not self.is_processing:
-                            self.update_status(f"ISO not deleted because processing was stopped: {filename}", current_index=current_index, total_count=total_count)
-                        else:
-                            self.update_status(f"ISO kept (delete option disabled): {filename}", current_index=current_index, total_count=total_count)
-                        return  # Success - exit retry loop
-                    else:
-                        error_msg = f"Error converting {filename}: Process returned {return_code}"
-                        if current_try < max_retries - 1:
-                            self.update_status(f"{error_msg}. Retrying in {retry_delay} seconds... (Attempt {current_try + 1}/{max_retries})", "error", current_index=current_index, total_count=total_count)
-                            time.sleep(retry_delay)
-                            current_try += 1
-                        else:
-                            self.update_status(f"Skipping {filename} - {error_msg} after {max_retries} attempts", "error", current_index=current_index, total_count=total_count)
-                            return
-                except PermissionError as e:
-                    if current_try < max_retries - 1:
-                        self.update_status(f"File access error: {str(e)}. Retrying in {retry_delay} seconds... (Attempt {current_try + 1}/{max_retries})", "error", current_index=current_index, total_count=total_count)
-                        time.sleep(retry_delay)
-                        current_try += 1
-                    else:
-                        self.update_status(f"Skipping {filename} - File access error after {max_retries} attempts: {str(e)}", "error", current_index=current_index, total_count=total_count)
-                        return
-                except Exception as e:
-                    self.update_status(f"Skipping {filename} - Unexpected error: {str(e)}", "error", current_index=current_index, total_count=total_count)
-                    return
-        finally:
-            # Always clean up, regardless of success or failure
-            self.game_title_var.set("None")  # Reset the game title display
-            if iso_path in self.handler.processing:
-                self.handler.processing.remove(iso_path)
-            self.iso_queue.task_done()
-            if self.use_ftp.get():
-                if current_index == total_count:
-                    try:
-                        self.update_status("FTP Transfer: Yes")
-                        self.send_over_ftp()
-                    except:
-                        self.update_status("FTP Transfer Error.")
-            else:
-                self.update_status("FTP Transfer: No")
-
-            self.update_status("Ready for next file in queue", current_index=current_index, total_count=total_count)
+        self.ftp.connect(ip, port, timeout=15)
+        self.ftp.login(user, pwd)
+        remote_folder = f"{drv}/Content/0000000000000000"
+        self.upload_folder(out_folder, remote_folder)
+        self.ftp.quit()
+        self.update_status("FTP 콘솔 전송 완료!", "success")
 
     def run(self):
         self.app.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -843,4 +898,4 @@ class Iso2GodGUI:
 
 if __name__ == "__main__":
     app = Iso2GodGUI()
-    app.run() 
+    app.run()
